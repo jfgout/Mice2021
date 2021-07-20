@@ -1,0 +1,518 @@
+---
+title: "Dan & Justin's data analysis"
+author: "JF GOUT"
+date: "3/9/2021"
+output: html_document
+params:
+  showCode: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r intro, echo=params$showCode, message=F, warning=F}
+rm(list=ls())
+# Modify this part to set the working directory to a location on your computer:
+if(.Platform$OS.type == "unix"){
+  setwd("/media/jfgout/E0545B0F545AE834/lab/MSSTATE/Justin")
+  options(width=Sys.getenv("COLUMNS"))
+} else {
+	setwd("C:/lab/MSSTATE/Justin")
+}
+
+library("tximport")
+library("DESeq2")
+library("ggplot2")
+
+MAX_PVAL = 0.05
+MIN_ROW_SUM = 100 # <- Remove genes that have fewer than this number of sum counts.
+REMAKE_TX2 = F
+
+
+################################################################################
+if( REMAKE_TX2 == T){
+  # Building the table that links transcripts to genes:
+  ENSMBL_103 = "AH89457"
+  library("ensembldb")
+  library(AnnotationHub)
+  ah <- AnnotationHub()
+  edb <- ah[["AH89457"]] # <- Ensembl 103
+
+  # This is the command allowing you to find the value of "AH89457"
+  #ahDb <- query(ah, pattern = c("Mus musculus", "EnsDb", 103))
+
+  txs <- transcripts(edb, return.type = "DataFrame")
+  tl = txs[ , c("tx_id_version", "gene_id")]
+  colnames(tl) = c("TXNAME", "GENEID")
+  write.table(tl, file="gene_transcript_link-103.tab", col.names=T, row.names=F, quote=F, sep="\t")
+}
+################################################################################
+
+tx2gene = read.table("gene_transcript_link-103.tab", h=T, as.is=T, sep="\t")
+nbGenesTx = nrow(tx2gene)
+
+my_runDESeq2 <- function(samples, tx2gene, design, MIN_ROW_SUM){
+  files <- file.path(samples$file)
+  txi <- tximport(files, type="kallisto", tx2gene=tx2gene)
+
+  dds <- DESeqDataSetFromTximport(txi, colData = samples, design = design)
+  
+  ddsc <- estimateSizeFactors(dds)
+  c = counts(ddsc, normalized=TRUE)
+  colnames(c) = paste(samples$mouse_id,samples$genotype,samples$stimulus,sep="_")
+  
+  keep <- rowSums(counts(dds)) >= MIN_ROW_SUM
+  dds <- dds[keep,]
+
+  dds <- DESeq(dds)
+  res = results(dds, cooksCutoff = Inf)
+  list(DESeq2res = res, counts = as.data.frame(c), dds=dds )
+}
+
+
+samples = read.table("ids", h=T, as.is=T, sep="\t")
+samples$file = paste("Kallisto-103-trimmed/", samples$mouse_id, samples$genotype, ".h5", sep="")
+rownames(samples) = paste(samples$mouse_id, samples$genotype, samples$sex, samples$stimulus, sep="_")
+samples$genotype = factor(samples$genotype, levels=c("WT", "KO"))
+samples$sex = factor(samples$sex, levels=c("F", "M"))
+samples$stimulus = factor(samples$stimulus, levels=c("PBS", "Spn"))
+
+```
+
+## Introduction
+
+This RNAseq dataset is looking at gene expression in Mice infected with *Streptococcus pneumoniae* for two different genotypes: WT and PUMA knock-out. 5 mice from each genotype were mock infected (PBS) or infected (Spn) --> 20 mice total.  
+RNAseq reads were trimmed for quality and TPM values were computed using Kallisto. Differential gene expression is performed using DEseq2.  
+
+The following table summarizes the data used as input for the DEseq2 analysis:
+
+```{r samples, echo=F, results='asis'}
+library(knitr)
+kable(samples)
+```
+
+## Results.
+
+### Genes differentially expressed:
+
+
+First, I searched for genes with a different reaction to infection between the two genotypes. This is done in DEseq2 with the following formula:  
+
+```{r formula, eval=F}
+design = ~ genotype + stimulus + genotype:stimulus
+```
+
+```{r res1, echo=T, message=F, warning=F}
+design = ~ genotype + stimulus + genotype:stimulus
+lres = my_runDESeq2(samples = samples, tx2gene = tx2gene, design = design, MIN_ROW_SUM = MIN_ROW_SUM)
+res = lres[["DESeq2res"]]
+c = lres[["counts"]]
+dds = lres[["dds"]]
+sigGenes <- subset(res, padj < MAX_PVAL)
+nbSig = nrow(sigGenes)
+nbGenesKept = nrow(c)
+
+```
+
+I restricted the input to transcripts with sum of counts > `r MIN_ROW_SUM` (resulting in keeping `r nbGenesKept` genes out of `r nbGenesTx` total transcripts in the genome). This steps removes genes with very few reads across all samples (= genes that are never expressed during the experiment). The main reason to do so is to reduce the size of the input to speed up calculation and mostly to increase statistical power (fewer genes as input -> more power during correction for multiple testing).  
+
+With these parameters, DEseq2 finds `r nbSig` deferentially expressed genes (with adjusted p-value < `r MAX_PVAL`).  
+
+  
+
+List of significant genes:  
+```{r echo=F, results='asis'}
+kable(sigGenes)
+```
+
+
+## Data quality checks.
+
+The goal of this section is to perform a basic quality check on the data. One way to perform this check is to make sure that samples of the same genotype+stimulus combination cluster together.
+
+### Heatmap
+
+
+```{r heatmap, echo = T, message=F, warning=F}
+library("pheatmap")
+library("vsn")
+library("hexbin")
+
+blind = T
+vsd <- vst(dds, blind=blind)
+
+nbTopGenes = 100
+select <- order(rowMeans(counts(dds,normalized=TRUE)), decreasing=TRUE)[1:nbTopGenes]
+df <- as.data.frame(colData(dds)[,c("genotype","stimulus", "sex")])
+```
+
+I performed a simple heatmap clustering analysis, using the top `r nbTopGenes` most highly expressed genes (note: the clustering does not change when using more genes):  
+
+```{r heatmapPlot, echo=T, results='asis'}
+ph <- pheatmap(assay(vsd)[select,], cluster_rows=T, show_rownames=F, cluster_cols=T, annotation_col=df)
+ph
+
+```
+
+The 3 genes at the top of the heatmap seem to be driving a lot of the clustering (genes with low expression level in the "left" cluster (with mostly PBS) and higher expression level in the "right" cluster which contains only Spn samples) are:
+
+```{r echo=T}
+w = ph$tree_row$order[1:3]
+print(ph$tree_row$labels[w])
+```
+
+### Sample to sample distance:
+
+```{r sDist, echo=T, message=FALSE, warning=FALSE}
+sampleDists <- dist(t(assay(vsd)))
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$mouse_id, vsd$genotype, vsd$stimulus, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+
+```
+
+Both analyzes point at 3 Spn samples (Mice 870, 413, 864) clustering with the PBS samples, which makes me suspect that these 3 samples should be removed from the analysis. So, I repeated the analysis after removing them.
+
+## Analysis with outliers removed
+
+```{r removeOutliers, echo=T, warning=FALSE, message=FALSE}
+vMiceOutliers = c(870, 413, 864)
+samplesNO = samples[which( is.element(samples$mouse_id, vMiceOutliers)==F ) , ]
+
+design = ~ genotype + stimulus + genotype:stimulus
+lresNO = my_runDESeq2(samples = samplesNO, tx2gene = tx2gene, design = design, MIN_ROW_SUM = MIN_ROW_SUM)
+resNO = lresNO[["DESeq2res"]]
+cNO = lresNO[["counts"]]
+ddsNO = lresNO[["dds"]]
+sigGenesNO <- subset(resNO, padj < MAX_PVAL)
+nbSig = nrow(sigGenesNO)
+
+vg = rownames(sigGenes)
+vNO = rownames(sigGenesNO)
+vAdded = setdiff(vNO, vg)
+vRemoved = setdiff(vg, vNO)
+```
+
+After removing these 3 outliers, DEseq2 finds `r nbSig` deferentially expressed genes (with adjusted p-value < `r MAX_PVAL`).  
+
+```{r echo=T, results='asis'}
+kable(sigGenesNO)
+```
+
+Genes 'added' to the list of significant genes: `r vAdded`  
+
+  
+  
+  
+
+Genes 'removed' from the list of significant genes: `r vRemoved`
+
+
+## Gene ontology analysis.
+
+I used the package topGO to search for GO categories over-represented within deferentially expressed genes. 
+
+```{r topGO-functions, echo=T, message=FALSE, warning=FALSE}
+
+library("topGO")
+library("ALL")
+library("hgu95av2.db")
+library("org.Mm.eg.db")
+library("Rgraphviz")
+
+getGeneUniverse <- function(deseqRes){
+  vgs = as.numeric(deseqRes$pvalue)
+  names(vgs) = rownames(deseqRes)
+  vgs
+}
+
+sel_pval <- function(allScore){ return(allScore < 0.05)}
+
+
+################################################################################
+# my_runGO: a wrapper to run all the topGO analysis
+#
+# statForGO:  Which statistical method to use in the "runTest" function
+# algorithm:  which algorithm to use in the "runTest"
+# geneUniverse: a vector containing the values to use for each gene (typically the p-value from DEseq2) with the names of each element being the gene ID
+# geneSel:  The function to use for gene selection
+# ontology: Which gene ontology to run the analysis on? (One of: BP, MF, CC)
+# padjust:  method to use for multiple testing correction. Specify one of: "holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none" (default is fdr)
+# padjustCutOff:  return only categories with an adjust p-value below this cutoff (set to 1 to return all the data)
+# MIN_ANNOTATED: remove categories with fewer than MIN_ANNOTATED genes before p-value adjustement
+my_runGO <- function( 
+  statForGO = c("ks", "fisher", "t", "globaltest", "sum")[1], 
+  algorithm = c("classic", "elim", "weight", "weight01", "lea", "parentchild")[1], 
+  geneUniverse = c(), 
+  geneSel, 
+  ontology = "BP", 
+  nodeSize=10, 
+  annot=annFUN.org, mapping="org.Mm.eg", ID = "ensembl",
+  padjust = "fdr",
+  padjustCutOff = 0.05,
+  MIN_ANNOTATED = 0
+  ){
+
+  GOdata = new("topGOdata", description="diff expr GO test", ontology= ontology,  
+               allGenes = geneUniverse, geneSel = geneSel, 
+               nodeSize = nodeSize, annot=annFUN.org, mapping="org.Mm.eg", ID = "ensembl")
+
+  result = runTest(GOdata, statistic = statForGO, algorithm = algorithm)
+
+  allGO = usedGO(object = GOdata)
+  allRes <- GenTable(GOdata, pval = result, topNodes = length(allGO))
+  allRes = allRes[which(allRes$Annotated>=MIN_ANNOTATED) , ]
+
+  allRes$pval = as.numeric(allRes$pval)
+  allRes$padj = p.adjust(allRes$pval, method=padjust)
+  
+  ar = allRes[which(allRes$padj<=padjustCutOff) , ]
+  
+  ar$minv = apply(ar[,c("Significant","Expected")], 1, min)
+  ar$maxv = apply(ar[,c("Significant","Expected")], 1, max)
+  ar$FE = ar$maxv / ar$minv
+  
+  ar = ar[ , which( is.element( colnames(ar), c("minv","maxv") ) ==F ) ]
+  ar = ar[order(ar$FE, decreasing=T) , ]
+  
+  for(i in (1:nrow(ar))){
+    goID = ar[i,"GO.ID"]
+    goTerm = as.character(Term(goID))
+    ar[i,"Term"] = goTerm
+  }
+  
+  lres = list(resTable=ar, GOdata=GOdata)
+  lres
+}
+```
+
+```{r topGO-BP, echo=T, message=FALSE, warning=FALSE}
+padjustCutOff = 0.05
+padjustMethod = "fdr"
+
+resGO = resNO
+lresBP = my_runGO(statForGO = "ks", algorithm = "elim", geneUniverse = getGeneUniverse(resGO), 
+               geneSel = sel_pval,
+               ontology = "BP",
+               padjust = padjustMethod,
+               padjustCutOff = padjustCutOff
+               )
+
+tGO_BP = lresBP[["resTable"]]
+GOdata_BP = lresBP[["GOdata"]]
+```
+
+
+
+## Biological processes:
+
+I found `r nrow(tGO_BP)` functional categories with adjusted p-value < `r padjustCutOff` (using the `r padjustMethod` method to adjust p-values for multiple testing):
+
+```{r echo=FALSE}
+kable(tGO_BP)
+```
+
+
+```{r topGO-part2-functions, echo=F, message=FALSE, warning=FALSE}
+
+REDO_GRAPHS_TABLES = F
+
+if( REDO_GRAPHS_TABLES==T ){
+
+  blind = F
+  vsd <- vst(ddsNO, blind=blind)
+  tc = as.data.frame(assay(vsd))
+  
+  vc = rownames(samplesNO[which(samplesNO$genotype=="WT" & samplesNO$stimulus=="PBS") , ])
+  tc$WT_PBS = apply(tc[ , vc], 1, median)
+  vc = rownames(samplesNO[which(samplesNO$genotype=="WT" & samplesNO$stimulus=="Spn") , ])
+  tc$WT_Spn = apply(tc[ , vc], 1, median)
+  
+  vc = rownames(samplesNO[which(samplesNO$genotype=="KO" & samplesNO$stimulus=="PBS") , ])
+  tc$KO_PBS = apply(tc[ , vc], 1, median)
+  vc = rownames(samplesNO[which(samplesNO$genotype=="KO" & samplesNO$stimulus=="Spn") , ])
+  tc$KO_Spn = apply(tc[ , vc], 1, median)
+  
+  tc$lFC_WT = tc$WT_Spn - tc$WT_PBS
+  tc$lFC_KO = tc$KO_Spn - tc$KO_PBS
+  
+  tc$lFC = tc$lFC_KO - tc$lFC_WT
+  tcr = tc[which(tc$lFC_KO>(-2) & tc$lFC_WT>(-2)) , ]
+  
+  plotGO_scatter <- function(allGO, tcp, goID, goTerm="", x="lFC_WT", y="lFC_KO"){
+    
+    vGenes = allGO[goID]
+    vGenes = unlist(vGenes)
+  
+    myLabOther = "All other genes"
+      
+    tcp$GO = myLabOther
+    tcp[vGenes, "GO"] = goID
+    tcp$GO = factor(tcp$GO, levels = c(goID, myLabOther))
+    
+    w1 = which( is.element(rownames(tcp), vGenes)==F )
+    w2 = which( is.element(rownames(tcp), vGenes)==T )
+    tcpl = rbind(tcp[w1 , ], tcp[w2 , ])
+  
+    myLabGO = goID
+    if( goTerm != "" ){
+      myLabGO = paste(goID, "\n(", goTerm, ")", sep="")
+    }
+    
+    gp <- ggplot(tcpl, aes_string(x=x, y=y)) + 
+            geom_point(aes(color = GO), size=1) + 
+            geom_smooth(se=T, color="black") +
+            scale_color_manual(labels=c(myLabGO, myLabOther), values=c("red", "steelblue"))
+            
+      gp
+  }
+  
+  writeAllGO_tables <- function(GOdata, tGO, deseq2res, folder, verbose = F){
+  
+    allGO <- genesInTerm(GOdata)
+  
+    for(goID in tGO$GO.ID){
+      if(verbose==T){ print(goID) }
+      vGenes = allGO[goID]
+      vGenes = unlist(vGenes)
+      tr = deseq2res[vGenes,]
+      tr$geneID = rownames(tr)
+      vc1 = which(colnames(tr)=="geneID")
+      vc2 = which(colnames(tr)!="geneID")
+      tro = tr [order(tr$pvalue, decreasing=F) , c(vc1,vc2)]
+      
+      goSub = gsub(":", "_", goID)
+      fName = paste(folder, "/", goSub, ".csv", sep="")
+      write.table(tro, file = fName, col.names = T, row.names = F, sep=",", quote=F)
+    }
+      
+  }
+  
+  makeAllGO_graphs <- function(GOdata, tGO, tcp, folder, xlim=c(-2,6), ylim=c(-2,6), verbose = F ){
+   
+    allGO_local <- genesInTerm(GOdata)
+    tGO_local = tGO
+  
+    for(goID in tGO_local$GO.ID){
+      
+      if(verbose==T){ print(goID) }
+  
+      goTerm = as.character(tGO_local$Term[which(tGO_local$GO.ID==goID)])
+  
+      gp = plotGO_scatter(allGO = allGO_local, tcp = tcp, goID = goID, goTerm=goTerm, x="lFC_WT", y="lFC_KO")
+      gp1 = gp + 
+        labs(x="WT log fold change", y="PUMA KO log fold change", title="log fold change upon infection for PUMA-KO vs WT") + 
+        theme(plot.title = element_text(hjust = 0.5)) + 
+        theme(legend.text=element_text(size=rel(1.0))) +
+        theme(legend.position="top") +
+        xlim(xlim[1],xlim[2]) + ylim(ylim[1],ylim[2])
+  
+    
+      goSub = gsub(":", "_", goID)
+      fName = paste(goSub, ".jpg", sep="")
+      ggsave(fName, path=folder, plot=gp1, width=8, height=8)
+    }
+  }
+
+  writeAllGO_tables(GOdata = GOdata_BP, tGO = tGO_BP, deseq2res = resNO, folder="./GO-Genes-Tables/BiologicalProcess", verbose=F)
+
+#tcrr = tcr[which(tcr$lFC_KO>(-1) & tcr$lFC_WT>(-1)) , ]
+makeAllGO_graphs(GOdata = GOdata_BP, tGO = tGO_BP, tcp = tcr, 
+                 xlim=c(-1,6), ylim=c(-1,6), 
+                 folder="./GO-Genes-graphs-1/BiologicalProcess/", verbose=F)
+
+goID = "GO:0035458"
+
+
+allGO_local <- genesInTerm(GOdata_BP)
+tGO_local = tGO_BP
+
+goTerm = as.character(tGO_local$Term[which(tGO_local$GO.ID==goID)])
+
+
+gp = plotGO_scatter(allGO = allGO_local, tcp = tcr, goID = goID, goTerm=goTerm, x="lFC_WT", y="lFC_KO")
+gp1 = gp + 
+  labs(x="WT log fold change", y="PUMA KO log fold change", title="log fold change upon infection for PUMA-KO vs WT") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  theme(legend.text=element_text(size=rel(1.0))) +
+  theme(legend.position="top") +
+  xlim(-2,6) + ylim(-2,6)
+
+  
+}
+
+```
+
+
+
+## Molecular functions:
+
+```{r topGO-MF, echo=T, message=FALSE, warning=FALSE}
+
+lresMF = my_runGO(statForGO = "ks", algorithm = "elim", geneUniverse = getGeneUniverse(resGO), 
+               geneSel = sel_pval,
+               ontology = "MF",
+               padjust = padjustMethod,
+               padjustCutOff = padjustCutOff
+               )
+
+tGO_MF = lresMF[["resTable"]]
+kable(tGO_MF)
+
+```
+
+```{r echo=F}
+tGO_local = tGO_MF
+GOdata_MF = lresMF[["GOdata"]]
+
+if( REDO_GRAPHS_TABLES==T ){
+
+  writeAllGO_tables(GOdata = GOdata_MF, tGO = tGO_MF, deseq2res = resNO, folder="./GO-Genes-Tables/MolecularFunction", verbose=F)
+  makeAllGO_graphs(GOdata = GOdata_MF, tGO = tGO_MF, tcp = tcr, 
+                   xlim=c(-1,6), ylim=c(-1,6), 
+                   folder="./GO-Genes-graphs-1/MolecularFunction/", verbose=F)
+  
+}
+```
+
+## Cellular components:
+
+```{r topGO-CC, echo=T, message=FALSE, warning=FALSE}
+
+lresCC = my_runGO(statForGO = "ks", algorithm = "elim", geneUniverse = getGeneUniverse(resGO), 
+               geneSel = sel_pval,
+               ontology = "CC",
+               padjust = padjustMethod,
+               padjustCutOff = padjustCutOff
+               )
+
+tGO_CC = lresCC[["resTable"]]
+kable(tGO_CC)
+```
+
+```{r echo=F}
+if( REDO_GRAPHS_TABLES==T ){
+
+GOdata_CC = lresCC[["GOdata"]]
+
+#allGO_CC <- genesInTerm(GOdata_CC)
+writeAllGO_tables(GOdata = GOdata_MF, tGO = tGO_MF, deseq2res = resNO, folder="./GO-Genes-Tables/CellularComponent", verbose=F)
+
+
+makeAllGO_graphs(GOdata = GOdata_CC, tGO = tGO_CC, tcp = tcr, 
+                 xlim=c(-1,6), ylim=c(-1,6), 
+                 folder="./GO-Genes-graphs-1/CellularComponent/", verbose=F)
+
+
+
+
+}
+
+```
